@@ -40,6 +40,8 @@ const CALIB00: u8 = 0x88;
 // Raw 20-bit value returned when pressure measurement is skipped.
 const SKIPPED_PRESSURE_READING: i32 = 0x80000;
 
+const MAX_READ_ATTEMPTS: u8 = 2;
+
 #[derive(Clone, Copy, PartialEq)]
 enum DeviceState {
     Identify,
@@ -93,6 +95,7 @@ pub struct Bme280<'a, I: I2CDevice> {
     pending_temp: Cell<bool>,
     pending_hum: Cell<bool>,
     pending_press: Cell<bool>,
+    read_attempts_remaining: Cell<u8>,
 }
 
 impl<'a, I: I2CDevice> Bme280<'a, I> {
@@ -110,6 +113,7 @@ impl<'a, I: I2CDevice> Bme280<'a, I> {
             pending_temp: Cell::new(false),
             pending_hum: Cell::new(false),
             pending_press: Cell::new(false),
+            read_attempts_remaining: Cell::new(MAX_READ_ATTEMPTS),
         }
     }
 
@@ -230,6 +234,7 @@ impl<I: I2CDevice> I2CClient for Bme280<'_, I> {
 
             self.buffer.replace(buffer);
             self.op.set(Operation::None);
+            self.read_attempts_remaining.set(MAX_READ_ATTEMPTS);
             if last_op == Operation::Read {
                 let pending_temp = self.pending_temp.get();
                 let pending_press = self.pending_press.get();
@@ -346,22 +351,54 @@ impl<I: I2CDevice> I2CClient for Bme280<'_, I> {
 
                     // Retry zero temperature or humidity readings, which indicate a misread.
                     if adc_temperature == 0 || (pending_hum && adc_hum == 0) {
+                        if self.read_attempts_remaining.get() == 1 {
+                            self.buffer.replace(buffer);
+                            self.op.set(Operation::None);
+                            self.read_attempts_remaining.set(MAX_READ_ATTEMPTS);
+
+                            self.pending_temp.set(false);
+                            self.pending_press.set(false);
+                            self.pending_hum.set(false);
+
+                            if pending_temp {
+                                self.temperature_client
+                                    .map(|client| client.callback(Err(ErrorCode::FAIL)));
+                            }
+
+                            if pending_press {
+                                self.pressure_client
+                                    .map(|client| client.callback(Err(ErrorCode::FAIL)));
+                            }
+
+                            if pending_hum {
+                                self.humidity_client.map(|client| client.callback(0));
+                            }
+
+                            return;
+                        }
+
+                        self.read_attempts_remaining
+                            .set(self.read_attempts_remaining.get() - 1);
+
                         self.buffer.replace(buffer);
                         if let Err(error) = self.start_read() {
+                            self.read_attempts_remaining.set(MAX_READ_ATTEMPTS);
+
+                            self.pending_temp.set(false);
+                            self.pending_press.set(false);
+                            self.pending_hum.set(false);
+
                             if pending_temp {
-                                self.pending_temp.set(false);
                                 self.temperature_client
                                     .map(|client| client.callback(Err(error)));
                             }
 
                             if pending_press {
-                                self.pending_press.set(false);
                                 self.pressure_client
                                     .map(|client| client.callback(Err(error)));
                             }
 
                             if pending_hum {
-                                self.pending_hum.set(false);
                                 self.humidity_client.map(|client| client.callback(0));
                             }
                         }
@@ -393,6 +430,7 @@ impl<I: I2CDevice> I2CClient for Bme280<'_, I> {
 
                     self.buffer.replace(buffer);
                     self.op.set(Operation::None);
+                    self.read_attempts_remaining.set(MAX_READ_ATTEMPTS);
 
                     if let Some(temperature) = temperature {
                         self.pending_temp.set(false);
