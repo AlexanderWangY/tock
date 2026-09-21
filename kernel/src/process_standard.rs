@@ -605,20 +605,27 @@ impl<C: Chip, D: 'static + ProcessStandardDebug> Process for ProcessStandard<'_,
         let ret = self.tasks.map_or(Err(ErrorCode::FAIL), |tasks| {
             match tasks.enqueue(task) {
                 true => {
+                    let opt_this_upcall_id = match task {
+                        Task::FunctionCall(FunctionCall {
+                            source: FunctionCallSource::Driver(upcall_id),
+                            ..
+                        }) => Some(upcall_id),
+                        Task::ReturnValue(ReturnArguments { upcall_id, .. }) => Some(upcall_id),
+                        _ => None,
+                    };
+
                     // If the process is yielded-for this task, set the ready flag.
-                    if let State::YieldedFor(yielded_upcall_id) = self.state.get() {
-                        if let Some(upcall_id) = match task {
-                            Task::FunctionCall(FunctionCall {
-                                source: FunctionCallSource::Driver(upcall_id),
-                                ..
-                            }) => Some(upcall_id),
-                            Task::ReturnValue(ReturnArguments { upcall_id, .. }) => Some(upcall_id),
-                            _ => None,
-                        } {
-                            self.is_yield_wait_for_ready
-                                .set(upcall_id == yielded_upcall_id);
-                        }
+                    //
+                    // In case the process is yielding for another upcall, don't
+                    // clear the flag; this would re-introduce the race
+                    // condition of #5195.
+                    if let State::YieldedFor(yielded_upcall_id) = self.state.get()
+                        && let Some(this_upcall_id) = opt_this_upcall_id
+                        && yielded_upcall_id == this_upcall_id
+                    {
+                        self.is_yield_wait_for_ready.set(true);
                     }
+
                     // The task has been successfully enqueued.
                     Ok(())
                 }
@@ -1604,9 +1611,10 @@ impl<C: Chip, D: 'static + ProcessStandardDebug> Process for ProcessStandard<'_,
         ProcessAddresses {
             flash_start: self.flash_start() as usize,
             flash_non_protected_start: self.flash_non_protected_start(),
-            flash_integrity_end: ((self.flash.as_ptr() as usize)
-                + (self.header.get_binary_end() as usize))
-                as *const u8,
+            flash_integrity_end: self
+                .flash
+                .as_ptr()
+                .wrapping_add(self.header.get_binary_end() as usize),
             flash_end: self.flash_end(),
             sram_start: self.mem_start() as usize,
             sram_app_brk: self.app_memory_break() as usize,
@@ -2311,11 +2319,12 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
             }
         }
 
-        let flash_start = process.flash.as_ptr();
+        let flash_start: *const u8 = process.flash.as_ptr();
         let app_start =
             flash_start.wrapping_add(process.header.get_app_start_offset() as usize) as usize;
-        let init_addr =
-            flash_start.wrapping_add(process.header.get_init_function_offset() as usize) as usize;
+        let init_addr: *const () = flash_start
+            .wrapping_add(process.header.get_init_function_offset() as usize)
+            .cast();
         let fn_base = flash_start as usize;
         let fn_len = process.flash.len();
 
@@ -2335,7 +2344,7 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         //  - We only pass this pointer to this process.
         let init_fn = unsafe {
             CapabilityPtr::new_with_authority(
-                init_addr as *const (),
+                init_addr,
                 fn_base,
                 fn_len,
                 CapabilityPtrPermissions::Execute,
@@ -2509,11 +2518,12 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         self.state.set(State::Yielded);
 
         // And queue up this app to be restarted.
-        let flash_start = self.flash_start();
+        let flash_start: *const u8 = self.flash_start();
         let app_start =
             flash_start.wrapping_add(self.header.get_app_start_offset() as usize) as usize;
-        let init_addr =
-            flash_start.wrapping_add(self.header.get_init_function_offset() as usize) as usize;
+        let init_addr: *const () = flash_start
+            .wrapping_add(self.header.get_init_function_offset() as usize)
+            .cast();
 
         // We need to construct a capability with sufficient authority to cover
         // all of a user's code, with permissions to execute it. The entirety
@@ -2531,7 +2541,7 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         //  - We only pass this pointer to this process.
         let init_fn = unsafe {
             CapabilityPtr::new_with_authority(
-                init_addr as *const (),
+                init_addr,
                 flash_start as usize,
                 self.flash_end() - (flash_start as usize),
                 CapabilityPtrPermissions::Execute,
